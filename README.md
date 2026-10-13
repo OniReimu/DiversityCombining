@@ -46,7 +46,7 @@ The generation records are published as a Hugging Face dataset. Download them
 into `data/` and point `DC_CACHE_ROOT` at that directory:
 
 ```text
-hf download OniReimu/DiversityCombining --repo-type dataset --local-dir data
+hf download UTSCybeR/DiversityCombining --repo-type dataset --local-dir data
 export DC_CACHE_ROOT=data
 ```
 
