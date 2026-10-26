@@ -147,6 +147,7 @@ MODEL_CONFIGS = {
 TASK_CHOICES = [
     "gsm8k", "math", "hotpotqa", "triviaqa", "boolq",
     "drop", "mmlu", "hellaswag", "cruxeval", "mbpp",
+    "arc_challenge", "winogrande",
 ]
 DEFAULT_SEEDS = [42, 123, 456, 789, 1024]
 DEFAULT_N = 100
@@ -162,12 +163,18 @@ TASK_DEFAULT_MAX_NEW_TOKENS = {
     "hellaswag": 512,
     "cruxeval": 1024,
     "mbpp": 1024,
+    "arc_challenge": 1024,
+    "winogrande": 512,
 }
 ANSWER_FORMAT_SUFFIX = {
     "mmlu": "\n\nReason step by step, then end your response with the letter of the correct option "
             "on its own final line, in the form: #### <letter>",
     "hellaswag": "\n\nReason step by step, then end your response with the letter of the correct option "
                  "on its own final line, in the form: #### <letter>",
+    "arc_challenge": "\n\nReason step by step, then end your response with the letter of the correct option "
+                     "on its own final line, in the form: #### <letter>",
+    "winogrande": "\n\nReason step by step, then end your response with the letter of the correct option, "
+                  "A or B, on its own final line, in the form: #### <letter>",
     "boolq": "\n\nEnd your response with your answer on its own final line, in the form: #### yes "
              "or #### no",
     "hotpotqa": "\n\nEnd your response with the short answer span on its own final line, "
@@ -757,37 +764,38 @@ def extract_hotpotqa_answer(
     return None
 
 
-def extract_mc_answer(text: str, is_truncated: bool = False) -> str | None:
-    """Extract option letter (A/B/C/D) for multiple choice tasks (MMLU, HellaSwag)."""
+def extract_mc_answer(text: str, is_truncated: bool = False, letters: str = "ABCD") -> str | None:
+    """Extract the option letter for multiple choice tasks; `letters` lists the valid options."""
+    opt = f"[{letters}]"
     clean_text = _strip_template_artifacts(_strip_think_tags(text)).strip()
     boxed = extract_boxed_answer(clean_text)
     if boxed is None and clean_text != text:
         boxed = extract_boxed_answer(text)
     if boxed is not None:
-        letters = re.findall(r"\b([A-D])\b", boxed, re.IGNORECASE)
-        if letters:
-            return letters[-1].upper()
-    matches = list(re.finditer(r"####\s*\(?\b([A-D])\b\)?", clean_text, re.IGNORECASE))
+        boxed_letters = re.findall(rf"\b({opt})\b", boxed, re.IGNORECASE)
+        if boxed_letters:
+            return boxed_letters[-1].upper()
+    matches = list(re.finditer(rf"####\s*\(?\b({opt})\b\)?", clean_text, re.IGNORECASE))
     if matches:
         return matches[-1].group(1).upper()
     # Declared answer: take last match, word boundaries on bare words
     matches = list(re.finditer(
-        r"\b(?:final\s+answer|answer|correct(?:\s+answer)?)\b\s*(?:is\b|=|:)\s*\(?\b([A-D])\b\)?",
+        rf"\b(?:final\s+answer|answer|correct(?:\s+answer)?)\b\s*(?:is\b|=|:)\s*\(?\b({opt})\b\)?",
         clean_text,
         re.IGNORECASE,
     ))
     if matches:
         return matches[-1].group(1).upper()
     # Direct match: "A", "B", "C", "D" at start
-    m = re.match(r"^([A-D])\b", clean_text)
+    m = re.match(rf"^({opt})\b", clean_text)
     if m:
         return m.group(1).upper()
     if is_truncated:
         return None
     # Last standalone letter
-    letters = re.findall(r"\b([A-D])\b", clean_text)
-    if letters:
-        return letters[-1].upper()
+    found = re.findall(rf"\b({opt})\b", clean_text)
+    if found:
+        return found[-1].upper()
     return None
 
 
@@ -829,6 +837,10 @@ def extract_answer(
         answer = extract_hotpotqa_answer(text, is_truncated=is_truncated)
     elif task in ("mmlu", "hellaswag"):
         answer = extract_mc_answer(text, is_truncated=is_truncated)
+    elif task == "arc_challenge":
+        answer = extract_mc_answer(text, is_truncated=is_truncated, letters="ABCDE")
+    elif task == "winogrande":
+        answer = extract_mc_answer(text, is_truncated=is_truncated, letters="AB")
     elif task == "cruxeval":
         answer = extract_literal_answer(text, is_truncated=is_truncated)
     elif task == "mbpp":
@@ -884,6 +896,46 @@ def load_task_instances(task: str) -> list[dict]:
                 "prompt": prompt,
                 "answer": gold,
                 "metadata": {"source_id": item.get("source_id", "")},
+            })
+        return instances
+    elif task == "arc_challenge":
+        from datasets import load_dataset
+        ds = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="test")
+        instances = []
+        for item in ds:
+            # Options are relabelled A, B, C, ... by position; a few items use 1-4 or have 3 or 5 options.
+            labels = [chr(ord("A") + j) for j in range(len(item["choices"]["text"]))]
+            choices_str = "\n".join(f"{label}) {text}" for label, text in zip(labels, item["choices"]["text"]))
+            prompt = (
+                f"Answer the following multiple choice question.\n\n"
+                f"{item['question']}\n\n"
+                f"{choices_str}\n\n"
+                f"Answer:"
+            )
+            gold = labels[list(item["choices"]["label"]).index(item["answerKey"])]
+            instances.append({
+                "prompt": prompt,
+                "answer": gold,
+                "metadata": {"id": item.get("id", ""), "n_options": len(labels)},
+            })
+        return instances
+    elif task == "winogrande":
+        from datasets import load_dataset
+        # The test split has no labels, so the labelled validation split is the evaluation set.
+        ds = load_dataset("allenai/winogrande", "winogrande_xl", split="validation")
+        instances = []
+        for item in ds:
+            prompt = (
+                f"Which option best fills the blank?\n\n"
+                f"{item['sentence']}\n\n"
+                f"A) {item['option1']}\nB) {item['option2']}\n\n"
+                f"Answer:"
+            )
+            gold = {"1": "A", "2": "B"}[str(item["answer"])]
+            instances.append({
+                "prompt": prompt,
+                "answer": gold,
+                "metadata": {},
             })
         return instances
     else:

@@ -145,6 +145,8 @@ SCORERS = {
     "hotpotqa": HotpotQAScorer,
     "mmlu": MCScorer,
     "hellaswag": MCScorer,
+    "arc_challenge": MCScorer,
+    "winogrande": MCScorer,
     "triviaqa": TriviaQAScorer,
     "drop": DropScorer,
     "cruxeval": CruxEvalScorer,
@@ -172,7 +174,7 @@ def canonicalize_answer(answer: str | None, task: str) -> str | None:
     elif task == "boolq":
         norm = normalize_boolq(answer)
         return norm if norm in ("yes", "no") else (norm if norm else None)
-    elif task in ("mmlu", "hellaswag"):
+    elif task in ("mmlu", "hellaswag", "arc_challenge", "winogrande"):
         clean = str(answer).strip().upper()
         return clean if clean else None
     elif task == "hotpotqa":

@@ -6,12 +6,10 @@ the strict majority vote with half credit at exact ties, and the beta-binomial a
 binomial majority-vote predictions. scripts/reproduce_tables.py imports mv_acc,
 bb_mv_acc and binom_mv_acc from here.
 
-main() prints the same tables from the earlier 5-seed records in the capability-
-matrix directory (qwen7b_rerun*.jsonl, llama3_1_8b_*.jsonl, mistral7b_*.jsonl):
-  Qwen-7B  : qwen7b_rerun.jsonl + qwen7b_rerun_seeds42_123.jsonl
-  Llama-8B : llama3_1_8b_gsm8k_rerun.jsonl (456/789/1024) + llama3_1_8b_sc_only.jsonl (42/123)
-  Mistral-7B: mistral7b_sc_only.jsonl, mistral7b_rerun.jsonl, mistral7b_k32_s{456,789,1024}.jsonl
-The published values are produced by scripts/reproduce_tables.py from the v2 records.
+main() prints the same tables from earlier 5-seed records that are not part of the
+data package (qwen7b_rerun*.jsonl, llama3_1_8b_*.jsonl, mistral7b_*.jsonl under
+experiment_dir("cache")). The published values are produced by
+scripts/reproduce_tables.py from the v2 records.
 
 Run:
   python scripts/aggregate_canonical_sc.py

@@ -576,7 +576,7 @@ def main():
         "lines.markersize": 10, "axes.linewidth": 1.5, "font.family": "sans-serif",
     })
 
-    fig, ax = plt.subplots(1, 1, figsize=(4, 3))
+    fig, ax = plt.subplots(1, 1, figsize=(4, 3.6))
     for label in ["Qwen-7B", "Llama-8B", "Mistral-7B"]:
         m_key = "Qwen2.5-7B" if label == "Qwen-7B" else ("Llama-3.1-8B" if label == "Llama-8B" else "Mistral-7B")
         d = plot_data_per_model[m_key]
@@ -591,7 +591,7 @@ def main():
                 alpha=0.5, linewidth=2.0, label=f"{label} Binom")
 
     ax.set_xlabel("$K$ (number of paths)")
-    ax.set_ylabel("MV Accuracy")
+    ax.set_ylabel("MV accuracy", fontsize=16)
     ax.set_xticks([4, 8, 16, 32])
     ax.set_xlim(2, 34)
     ax.set_ylim(0, 1.05)
@@ -604,8 +604,15 @@ def main():
         Line2D([], [], color="#555555", linestyle="--", linewidth=3.0, label="Observed"),
         Line2D([], [], color="#555555", linestyle=":", linewidth=2.0, alpha=0.6, label="Binomial"),
     ]
-    ax.legend(handles=style_handles, loc="lower right",
-              framealpha=0.9, edgecolor="#cccccc", fontsize=11)
+    model_handles = [
+        Line2D([], [], color=COLORS[label], linestyle="-", marker=MARKERS[label], markersize=7,
+               markeredgecolor="black", markeredgewidth=1.0, linewidth=2.5, label=label)
+        for label in ["Qwen-7B", "Llama-8B", "Mistral-7B"]
+    ]
+    # Models in the first legend row, line styles in the second, below the axes.
+    ax.legend(handles=[h for pair in zip(model_handles, style_handles) for h in pair],
+              loc="upper center", bbox_to_anchor=(0.42, -0.36), ncol=3, frameon=False,
+              fontsize=10, handlelength=1.6, columnspacing=1.2)
 
     fig.tight_layout()
     plot_pdf_path = OUT_DIR / "bb_calibration_cr.pdf"

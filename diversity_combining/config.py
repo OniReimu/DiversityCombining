@@ -24,12 +24,15 @@ RESULTS_ROOT = _root("DC_RESULTS_ROOT", PROJECT_ROOT / "results")
 REFERENCE_ROOT = _root("DC_REFERENCE_ROOT", PROJECT_ROOT / "reference")
 
 _LOCATIONS = {
-    # K=32 self-consistency records of the five primary cells
+    # K=32 self-consistency records: the five primary cells and the self-consistency
+    # arm of every cross-benchmark cell
     "sc_records": CACHE_ROOT / "sc_records",
     # K=32 self-consistency records of the reasoning model
     "reasoning_records": CACHE_ROOT / "reasoning_records",
-    # K=8 self-consistency and prompt-template records of the 5 x 12 matrix
-    "cache": CACHE_ROOT / "capability_matrix",
+    # K=8 prompt-template records of the 5 x 12 cross-benchmark cells, one folder per benchmark
+    "pt_records": CACHE_ROOT / "pt_records",
+    # default output directory of the generation drivers
+    "cache": CACHE_ROOT / "generated",
     "results": RESULTS_ROOT,
     "tables": RESULTS_ROOT / "tables",
     "cross_benchmark": RESULTS_ROOT / "cross_benchmark",

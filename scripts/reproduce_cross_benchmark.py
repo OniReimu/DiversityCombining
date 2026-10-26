@@ -1,676 +1,362 @@
 #!/usr/bin/env python3
-"""Reproduce the cross-benchmark prompt-template matrix (Table 3) and its derived numbers.
+"""Reproduce the cross-benchmark prompt-template analysis (5 models x 12 benchmarks, K=8).
 
-Reads the capability-matrix records (5 models x 12 benchmarks, K=8, self-consistency
-and prompt-template arms) from experiment_dir("cache"), scores GSM8K with the numeric
-scorer and MATH with the MATH-500 canonical scorer from scripts/scoring_v2.py, and
-writes numbers.json and rows_table3.tex to experiment_dir("cross_benchmark").
+For every model-benchmark cell, loads the prompt-template (PT) arm and the matched
+self-consistency (SC) arm (first 8 of the 32 SC paths) on the same (seed, instance)
+pairs through scripts/matched_arms.py, scores both arms with
+scripts/scoring_v2.check_task_correct, and computes the mean pairwise correlation,
+majority-vote accuracy, K_eff, accuracy-weighted voting and a paired bootstrap of
+Delta rho. Writes numbers.json and the LaTeX rows of Tables 7 and 9 to
+experiment_dir("cross_benchmark").
 
-- Estimators are imported from scripts.aggregate_5seed and scripts.analyze_mv_vs_weighted.
-- Scorers are imported from scripts.scoring_v2.
-- Data shape anomalies raise immediately.
+- Estimators are imported from scripts.aggregate_5seed, scripts.correlation_estimators
+  and scripts.analyze_mv_vs_weighted.
+- Every requested cell is mandatory; shape or matching anomalies raise immediately.
 """
 from __future__ import annotations
 
+import argparse
+from collections import Counter
+import hashlib
 import json
-import math
-import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import platform
+import sys
+from typing import Sequence
 
 import numpy as np
 from scipy import stats
+import scipy
 
-# Ensure project root in sys.path
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-_SRC = PROJECT_ROOT
-if _SRC.is_dir() and str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
-# ── Import estimators from scripts.aggregate_5seed (Hard rule: never copy) ─────
+# ruff: noqa: E402 -- direct script entrypoint needs repository and src on sys.path
+from scripts import matched_arms as pt
 from scripts.aggregate_5seed import (
-    BASE_ACC_THRESHOLD,
-    BENCHMARK_FILES,
-    DOMAIN_ORDER,
-    MODEL_LABELS,
-    MODELS,
-    bootstrap_pooled_drho_ci,
-    compute_mv_accuracy,
-    compute_pairwise_rho,
-    k_eff,
-    load_records,
+    BASE_ACC_THRESHOLD, _mean_pairwise_rho_vec, compute_mv_accuracy,
+    compute_pairwise_rho, k_eff,
 )
-
-# ── Import estimators from scripts.analyze_mv_vs_weighted ───────────────────────
-from scripts.analyze_mv_vs_weighted import (
-    mv_accuracy as wmv_mv_acc,
-    slot_cv,
-    weighted_mv_accuracy,
+from scripts.correlation_estimators import c_eq3
+from scripts.analyze_mv_vs_weighted import slot_cv, weighted_mv_accuracy
+from scripts.cross_benchmark_common import (
+    BENCHMARK_ORDER_TABLE3, TASK_ANSWER_SPACE, TASK_DISPLAY_NAMES,
+    build_block_covariance_matrix, get_scorers,
 )
+from scripts.cross_benchmark_outputs import write_outputs
+from diversity_combining.config import experiment_dir, record_path
+from scripts.scoring_v2 import check_task_correct, get_scorer
 
-# ── Import scorers from scripts.scoring_v2 (Hard rule: never copy) ─────────────
-from scripts.scoring_v2 import GSM8KScorer, MathScorer
-
-from diversity_combining.config import experiment_dir
 OUTPUT_DIR = experiment_dir("cross_benchmark")
-
-# Task answer space labels as printed in Table 3
-TASK_ANSWER_SPACE = {
-    "triviaqa": "open text",
-    "hotpotqa": "open text",
-    "arc_challenge": "bounded (4)",
-    "mmlu": "bounded (4)",
-    "hellaswag": "bounded (4)",
-    "winogrande": "binary (2)",
-    "drop": "open text",
-    "boolq": "binary (y/n)",
-    "mbpp": "code pass/fail",
-    "cruxeval": "code pass/fail",
-    "gsm8k": "numeric",
-    "math": "numeric",
-}
-
-TASK_DISPLAY_NAMES = {
-    "triviaqa": "TriviaQA",
-    "hotpotqa": "HotpotQA",
-    "arc_challenge": "ARC-C",
-    "mmlu": "MMLU",
-    "hellaswag": "HellaSwag",
-    "winogrande": "WinoGrande",
-    "drop": "DROP$^\\dagger$",
-    "boolq": "BoolQ",
-    "mbpp": "MBPP",
-    "cruxeval": "CruxEval",
-    "gsm8k": "GSM8K",
-    "math": "MATH",
-}
-
-BENCHMARK_ORDER_TABLE3 = [
-    ("QA", ["triviaqa", "hotpotqa"]),
-    ("Science/MC", ["arc_challenge", "mmlu"]),
-    ("Commonsense", ["hellaswag", "winogrande"]),
-    ("NLU", ["drop", "boolq"]),
-    ("Code", ["mbpp", "cruxeval"]),
-    ("Math", ["gsm8k", "math"]),
-]
-
-EXPECTED_SEEDS = [42, 123, 456, 789, 1024]
-INSTANCES_PER_ARM = 50
-
-# Exact production shape per arm: {seed: record count}. A full arm is 5 seeds x 50
-# and pooled as-is by aggregate_5seed.py (5seed_summary.csv N_pooled = SC total).
-FULL_ARM_SEED_COUNTS = {s: INSTANCES_PER_ARM for s in EXPECTED_SEEDS}
-PARTIAL_ARM_SEED_COUNTS = {
-    ("qwen7b", "math", "sc"): {42: 50, 123: 50, 456: 50, 789: 50, 1024: 26},   # N=226
-    ("qwen7b", "math", "pt"): {42: 50, 123: 50},                               # N=100
-    ("qwen32b", "math", "sc"): {42: 50, 123: 50, 456: 50, 789: 50, 1024: 35},  # N=235
-    ("qwen32b", "math", "pt"): {42: 50, 123: 50},                              # N=100
-    ("qwen7b", "mmlu", "pt"): {42: 50, 123: 50, 456: 24},                      # N=124
-    ("qwen32b", "mmlu", "pt"): {42: 50, 123: 50, 456: 50, 789: 8},             # N=158
-    ("qwen7b", "mbpp", "pt"): {42: 50, 123: 50, 456: 50, 789: 50, 1024: 23},   # N=223
-    ("llama8b", "math", "pt"): {42: 50, 123: 50, 456: 50, 789: 50, 1024: 1},   # N=201
-}
+TASKS = tuple(t for _, tasks in BENCHMARK_ORDER_TABLE3 for t in tasks)
+DOMAINS = {t: d for d, tasks in BENCHMARK_ORDER_TABLE3 for t in tasks}
+N_BOOT = 10_000
+RNG_SEED = 2026
+# Slot-accuracy CV and MV-accuracy partitions of the accuracy-weighted voting analysis.
+CV_THRESHOLD = 0.225
+MV_THRESHOLD = 0.3
 
 
-def expected_arm_seed_counts(model: str, task: str, arm: str) -> Dict[int, int]:
-    """Expected {seed: record count} for one arm ("sc" or "pt") of one cell."""
-    return PARTIAL_ARM_SEED_COUNTS.get((model, task, arm), FULL_ARM_SEED_COUNTS)
+def fingerprint(path: Path) -> dict:
+    return {"path": record_path(path), "md5": hashlib.md5(path.read_bytes()).hexdigest()}
 
 
-def assert_arm_shape(model: str, task: str, arm: str, recs: List[Dict[str, Any]]) -> None:
-    """Fail unless the arm has exactly the production seeds, per-seed N and instances."""
-    counts: Dict[int, int] = {}
-    for r in recs:
-        counts[r["seed"]] = counts.get(r["seed"], 0) + 1
-    counts = dict(sorted(counts.items()))
-    expected = expected_arm_seed_counts(model, task, arm)
-    assert counts == expected, (
-        f"{model}/{task}/{arm}: seed counts {counts} != production shape {expected}"
-    )
-    n_inst = len({r["instance_id"] for r in recs})
-    assert n_inst == INSTANCES_PER_ARM, (
-        f"{model}/{task}/{arm}: {n_inst} distinct instances != {INSTANCES_PER_ARM}"
-    )
-    n_keys = len({(r["seed"], r["instance_id"]) for r in recs})
-    assert n_keys == len(recs), (
-        f"{model}/{task}/{arm}: {len(recs) - n_keys} duplicate (seed, instance_id) records"
-    )
-
-
-def fmt_num(
-    val: Any,
-    digits: int,
-    *,
-    sign: bool = False,
-    scale: float = 1.0,
-    sci: bool = False,
-    below: Optional[float] = None,
-) -> str:
-    """The single rounding helper for printed numbers.
-
-    below=t renders the inequality "<t" or "≥t" (t in 1e-NN form) instead of a value.
-    Undefined values are an error: nothing undefined may be printed as a number.
-    """
-    if val is None or isinstance(val, bool):
-        raise ValueError(f"fmt_num got non-numeric value {val!r}")
-    v = float(val) * scale
-    if not math.isfinite(v):
-        raise ValueError(f"fmt_num got non-finite value {v!r}")
-    if below is not None:
-        return f"<{below:.0e}" if v < below else f"≥{below:.0e}"
-    spec = ("+" if sign else "") + f".{digits}" + ("e" if sci else "f")
-    return format(v, spec)
-
-
-def to_json_safe(obj: Any) -> Any:
-    """Recursively convert NaN/Inf to None and numpy scalars to Python scalars."""
-    if isinstance(obj, dict):
-        return {k: to_json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [to_json_safe(v) for v in obj]
-    if isinstance(obj, (bool, np.bool_)):
-        return bool(obj)
-    if isinstance(obj, (int, np.integer)):
-        return int(obj)
-    if isinstance(obj, (float, np.floating)):
-        f = float(obj)
-        return f if math.isfinite(f) else None
-    return obj
-
-
-def get_scorers() -> Tuple[GSM8KScorer, MathScorer]:
-    """Instantiate and validate the canonical scoring_v2 scorers."""
-    gsm = GSM8KScorer()
-    math_sc = MathScorer()
-    assert isinstance(gsm, GSM8KScorer), "gsm must be instance of GSM8KScorer"
-    assert isinstance(math_sc, MathScorer), "math_sc must be instance of MathScorer"
-    assert gsm.name == "gsm8k_numeric", f"Unexpected GSM8K scorer name: {gsm.name}"
-    assert math_sc.name == "math500_canonical_exact", f"Unexpected MATH scorer name: {math_sc.name}"
-    return gsm, math_sc
-
-
-def extract_correctness_vector(
-    record: Dict[str, Any],
-    task: str,
-    gsm_scorer: GSM8KScorer,
-    math_scorer: MathScorer,
-) -> List[int]:
-    """Extract binary correctness vector from record.
-
-    GSM8K answers are scored with gsm8k_numeric and MATH answers with
-    math500_canonical_exact. Other tasks use the stored correctness labels or
-    F1 values when present, otherwise normalized exact text equality.
-    """
-    if "all_correct" in record:
-        return [int(c) for c in record["all_correct"]]
-    if "all_f1s" in record:
-        return [1 if f >= 0.5 else 0 for f in record["all_f1s"]]
-    if "all_answers" in record and "gold_answer" in record:
-        gold = record["gold_answer"]
-        answers = record["all_answers"]
-        if task == "gsm8k":
-            return [int(bool(gsm_scorer(a, gold))) for a in answers]
-        elif task == "math":
-            return [int(bool(math_scorer(a, gold))) for a in answers]
-        else:
-            gold_str = str(gold).strip().lower()
-            return [1 if str(a).strip().lower() == gold_str else 0 for a in answers]
-
-    raise ValueError(f"Record contains no usable answers or labels: {record}")
-
-
-def build_pooled_matrix(
-    records: List[Dict[str, Any]],
-    task: str,
-    gsm_scorer: GSM8KScorer,
-    math_scorer: MathScorer,
-) -> np.ndarray:
-    """Build pooled (N, K) correctness matrix sorted by instance_id."""
-    records_sorted = sorted(records, key=lambda r: r.get("instance_id", 0))
-    rows = []
-    for r in records_sorted:
-        v = extract_correctness_vector(r, task, gsm_scorer, math_scorer)
-        rows.append(v)
-    mat = np.array(rows, dtype=float)
-    assert mat.ndim == 2 and mat.shape[1] == 8, f"Malformed matrix shape: {mat.shape}"
-    return mat
-
-
-def build_block_covariance_matrix(
-    records: List[Dict[str, Any]],
-    task: str,
-    gsm_scorer: GSM8KScorer,
-    math_scorer: MathScorer,
-) -> Optional[np.ndarray]:
-    """Build PT matrix matching analyze_block_covariance.py, with scoring_v2 for GSM8K and MATH."""
-    rows = []
+def source_grid(path: Path, task: str, arm: str) -> list[tuple[int, int]]:
+    """Supplement the GSM loader's legacy checks without changing that loader's outputs."""
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    keys = [(r["seed"], r["instance_id"]) for r in records]
+    seeds = pt.PT4_SEEDS if task in pt.PT4_TASKS + pt.ARCWG_TASKS else pt.EXPECTED_SEEDS
+    expected = {s: pt.INSTANCES_PER_SEED for s in seeds}
+    if dict(Counter(s for s, _ in keys)) != expected or len(set(keys)) != len(keys):
+        raise pt.CellMismatchError(f"{path}: duplicate keys or wrong seed grid; expected {expected}")
     for r in records:
-        if "all_correct" in r and r["all_correct"]:
-            rows.append(r["all_correct"])
-        elif "all_answers" in r and "gold_answer" in r:
-            if task == "gsm8k":
-                rows.append([int(bool(gsm_scorer(a, r["gold_answer"]))) for a in r["all_answers"]])
-            elif task == "math":
-                rows.append([int(bool(math_scorer(a, r["gold_answer"]))) for a in r["all_answers"]])
-            else:
-                g = str(r["gold_answer"]).strip().lower()
-                rows.append([1 if str(a).strip().lower() == g else 0 for a in r["all_answers"]])
-    if not rows:
-        return None
-    mat = np.array(rows, dtype=float)
-    return mat if mat.shape[0] >= 20 and mat.mean() >= BASE_ACC_THRESHOLD else None
+        field = "all_traces" if task == pt.TASK and arm == "PT" else "all_answers"
+        size = pt.K if arm == "PT" else 32
+        if not isinstance(r.get(field), list) or len(r[field]) != size:
+            raise pt.CellMismatchError(f"{path}: expected {size} {field} at {r['seed'], r['instance_id']}")
+        if r.get("K", size) != size:
+            raise pt.CellMismatchError(f"{path}: declared K disagrees with {field} length")
+        if r.get("task") != task or r.get("gold_answer") is None or r["gold_answer"] == "":
+            raise pt.CellMismatchError(f"{path}: wrong task or null gold")
+    return keys
 
 
-def run_table3_pipeline(
-    n_boot: int = 10_000,
-    rng_seed: int = 2026,
-) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], Dict[Tuple[str, str], np.ndarray]]:
-    """Run the 5-seed pooled matrix pipeline across all 60 cells.
-
-    Returns:
-      cells_data: (model, task) -> metrics dict
-      pt_matrices: (model, task) -> PT correctness matrix (for secondary analyses)
-    """
-    gsm_scorer, math_scorer = get_scorers()
-    rng = np.random.default_rng(rng_seed)
-
-    cells_data = {}
-    pt_matrices = {}
-
-    for model in MODELS:
-        for suffix, task_map in BENCHMARK_FILES.items():
-            records = load_records(model, suffix)
-            assert records, f"Failed to load records for {model}{suffix}"
-            for task, domain in task_map.items():
-                t_recs = [r for r in records if r.get("task") == task]
-                assert t_recs, f"No records found for {model} on {task}"
-
-                sc_recs = [r for r in t_recs if r.get("method") == "sc"]
-                pt_recs = [r for r in t_recs if r.get("method") == "sc_prompttpl"]
-
-                assert sc_recs, f"No SC records for {model} on {task}"
-                assert pt_recs, f"No PT records for {model} on {task}"
-
-                # Fail loudly on seed / per-seed N / instance counts
-                assert_arm_shape(model, task, "sc", sc_recs)
-                assert_arm_shape(model, task, "pt", pt_recs)
-                sc_seeds = sorted(set(r["seed"] for r in sc_recs))
-                pt_seeds = sorted(set(r["seed"] for r in pt_recs))
-
-                mat_sc = build_pooled_matrix(sc_recs, task, gsm_scorer, math_scorer)
-                mat_pt = build_pooled_matrix(pt_recs, task, gsm_scorer, math_scorer)
-
-                p_bar_sc = float(mat_sc.mean())
-                p_bar_pt = float(mat_pt.mean())
-                rho_sc = compute_pairwise_rho(mat_sc)
-                rho_pt = compute_pairwise_rho(mat_pt)
-                K = mat_sc.shape[1]
-                keff_sc = k_eff(K, rho_sc)
-                keff_pt = k_eff(K, rho_pt)
-                mv_acc_sc = compute_mv_accuracy(mat_sc)
-                mv_acc_pt = compute_mv_accuracy(mat_pt)
-                n_pooled = int(mat_sc.shape[0])
-
-                if not np.isnan(rho_sc) and abs(rho_sc) > 0.01:
-                    drho_pct = (rho_pt - rho_sc) / abs(rho_sc) * 100.0
-                else:
-                    drho_pct = float("nan")
-                dkeff = keff_pt - keff_sc
-
-                # Base accuracy exclusion rule
-                excluded = bool(np.isnan(p_bar_sc) or p_bar_sc < BASE_ACC_THRESHOLD)
-
-                # Bootstrap CI
-                if n_boot > 0 and not excluded:
-                    ci_lo, ci_hi = bootstrap_pooled_drho_ci(mat_sc, mat_pt, n_boot, rng)
-                else:
-                    ci_lo, ci_hi = float("nan"), float("nan")
-
-                cells_data[(model, task)] = {
-                    "model": model,
-                    "model_label": MODEL_LABELS[model],
-                    "task": task,
-                    "domain": domain,
-                    "n_seeds_sc": len(sc_seeds),
-                    "n_seeds_pt": len(pt_seeds),
-                    "N_pooled": n_pooled,
-                    "N_pt": int(mat_pt.shape[0]),
-                    "K": K,
-                    "p_bar_sc_pooled": p_bar_sc,
-                    "p_bar_pt_pooled": p_bar_pt,
-                    "rho_sc_pooled": rho_sc,
-                    "rho_pt_pooled": rho_pt,
-                    "keff_sc_pooled": keff_sc,
-                    "keff_pt_pooled": keff_pt,
-                    "mv_acc_sc_pooled": mv_acc_sc,
-                    "mv_acc_pt_pooled": mv_acc_pt,
-                    "drho_pct_pooled": drho_pct,
-                    "dkeff_pooled": dkeff,
-                    "drho_ci_low": ci_lo,
-                    "drho_ci_high": ci_hi,
-                    "excluded_base_acc": excluded,
-                }
-                pt_matrices[(model, task)] = mat_pt
-
-    assert len(cells_data) == 60, f"Expected 60 cells, got {len(cells_data)}"
-    return cells_data, pt_matrices
-
-
-def compute_derived_numbers(
-    cells: Dict[Tuple[str, str], Dict[str, Any]],
-    pt_matrices: Dict[Tuple[str, str], np.ndarray],
-) -> Dict[str, Any]:
-    """Compute every derived number in the paper from the matrix."""
-    valid_cells = [c for c in cells.values() if not c["excluded_base_acc"]]
-    assert len(valid_cells) == 57, f"Expected 57 valid cells, got {len(valid_cells)}"
-
-    drho_vals = np.array([c["drho_pct_pooled"] for c in valid_cells])
-    dkeff_vals = np.array([c["dkeff_pooled"] for c in valid_cells])
-
-    # 1. Headline valid counts and means
-    decorrelates_count = int((drho_vals < 0).sum())
-    mean_drho = float(drho_vals.mean())
-    mean_dkeff = float(dkeff_vals.mean())
-
-    # Exceptions (Delta rho >= 0)
-    exceptions = [c for c in valid_cells if c["drho_pct_pooled"] >= 0]
-    exceptions_summary = [
-        {
-            "model": c["model"],
-            "model_label": c["model_label"],
-            "task": c["task"],
-            "drho_pct": c["drho_pct_pooled"],
-            "p_bar_sc": c["p_bar_sc_pooled"],
-        }
-        for c in exceptions
-    ]
-
-    # 2. Table 3 benchmark rows
-    table3_rows = {}
-    for dom, tasks in BENCHMARK_ORDER_TABLE3:
-        for task in tasks:
-            task_cells = [c for c in valid_cells if c["task"] == task]
-            n_models = len(task_cells)
-            mean_drho_task = float(np.mean([c["drho_pct_pooled"] for c in task_cells]))
-            mean_dkeff_task = float(np.mean([c["dkeff_pooled"] for c in task_cells]))
-            mean_rho_sc_task = float(np.mean([c["rho_sc_pooled"] for c in task_cells]))
-            mean_rho_pt_task = float(np.mean([c["rho_pt_pooled"] for c in task_cells]))
-
-            table3_rows[task] = {
-                "domain": dom,
-                "benchmark": task,
-                "display_name": TASK_DISPLAY_NAMES[task],
-                "answer_space": TASK_ANSWER_SPACE[task],
-                "n_models": n_models,
-                "mean_drho_pct": mean_drho_task,
-                "mean_dkeff": mean_dkeff_task,
-                "mean_rho_sc": mean_rho_sc_task,
-                "mean_rho_pt": mean_rho_pt_task,
-            }
-
-    # 3. Domain means
-    domain_means = {}
-    for dom in ["QA", "Science/MC", "Commonsense", "NLU/Reasoning", "Code", "Math"]:
-        dom_cells = [c for c in valid_cells if c["domain"] == dom]
-        drhos = [c["drho_pct_pooled"] for c in dom_cells]
-        domain_means[dom] = {
-            "n_cells": len(dom_cells),
-            "mean_drho_pct": float(np.mean(drhos)),
-            "min_drho_pct": float(np.min(drhos)),
-            "max_drho_pct": float(np.max(drhos)),
-        }
-
-    # 4. Mann-Whitney test: Math vs QA
-    math_drhos = [c["drho_pct_pooled"] for c in valid_cells if c["domain"] == "Math"]
-    qa_drhos = [c["drho_pct_pooled"] for c in valid_cells if c["domain"] == "QA"]
-    assert len(math_drhos) == 10 and len(qa_drhos) == 10
-    mw_res = stats.mannwhitneyu(math_drhos, qa_drhos, alternative="greater")
-    mann_whitney = {
-        "n_math": len(math_drhos),
-        "n_qa": len(qa_drhos),
-        "u_statistic": float(mw_res.statistic),
-        "p_value": float(mw_res.pvalue),
+def load_cell(model: str, task: str) -> tuple[list, list, dict]:
+    if task == pt.TASK:
+        loaded = pt.load_arms(model)
+    elif task in pt.T12_TASKS:
+        loaded = pt.load_t12_arms(model, task)
+    elif task in pt.PT4_TASKS:
+        loaded = pt.load_pt4_arms(model, task)
+    elif task in pt.ARCWG_TASKS:
+        loaded = pt.load_arcwg_arms(model, task)
+    else:
+        raise ValueError(f"unknown task: {task}")
+    pt_cells, sc_cells, pt_path, sc_path = loaded
+    pt_keys, sc_keys = source_grid(pt_path, task, "PT"), source_grid(sc_path, task, "SC")
+    if set(pt_keys) != set(sc_keys) or len(pt_cells) != len(pt_keys) or len(sc_cells) != len(pt_keys):
+        raise pt.CellMismatchError(f"{model}/{task}: unmatched grid or loader length")
+    # Both loaders return their two arms in PT source order. Sort together for reproducibility.
+    order = sorted(range(len(pt_keys)), key=pt_keys.__getitem__)
+    if any(pt_cells[i][1] != sc_cells[i][1] for i in order):
+        raise pt.CellMismatchError(f"{model}/{task}: matched gold mismatch")
+    return [pt_cells[i] for i in order], [sc_cells[i] for i in order], {
+        "PT": fingerprint(pt_path), "SC": fingerprint(sc_path),
+        "seeds": sorted({s for s, _ in pt_keys}),
+        "instances_per_seed": pt.INSTANCES_PER_SEED,
+        "matched_keys_md5": hashlib.md5(json.dumps(sorted(pt_keys)).encode()).hexdigest(),
     }
 
-    # 5. Bootstrap CI analysis (Appendix app:statistical_precision)
-    ci_exclude_zero = [
-        c for c in valid_cells if (c["drho_ci_high"] < 0 or c["drho_ci_low"] > 0)
-    ]
-    ci_widths = [c["drho_ci_high"] - c["drho_ci_low"] for c in valid_cells]
-    qwen32b_math = cells[("qwen32b", "math")]
 
-    bootstrap_stats = {
-        "cells_excluding_zero_count": len(ci_exclude_zero),
-        "ci_width_median": float(np.median(ci_widths)),
-        "ci_width_iqr_25": float(np.percentile(ci_widths, 25)),
-        "ci_width_iqr_75": float(np.percentile(ci_widths, 75)),
-        "drho_min": float(np.min(drho_vals)),
-        "drho_max": float(np.max(drho_vals)),
-        "qwen32b_math_drho": qwen32b_math["drho_pct_pooled"],
-        "qwen32b_math_ci_low": qwen32b_math["drho_ci_low"],
-        "qwen32b_math_ci_high": qwen32b_math["drho_ci_high"],
-    }
+def correctness_matrix(cells: list, task: str) -> np.ndarray:
+    if not cells or any(len(a) != pt.K for a, _ in cells):
+        raise pt.CellMismatchError(f"{task}: expected nonempty (N, {pt.K}) answers")
+    return np.asarray([
+        [int(a is not None and check_task_correct(a, g, task)) for a in answers]
+        for answers, g in cells
+    ], dtype=float)
 
-    # 6. Table 8: Per-domain MV accuracy deltas (tab:pt_acc_delta)
-    table8_rows = {}
-    for dom in ["QA", "Science/MC", "Commonsense", "NLU/Reasoning", "Code", "Math"]:
-        dom_cells = [c for c in valid_cells if c["domain"] == dom]
-        mv_sc = [c["mv_acc_sc_pooled"] * 100.0 for c in dom_cells]
-        mv_pt = [c["mv_acc_pt_pooled"] * 100.0 for c in dom_cells]
-        delta_mv = [(c["mv_acc_pt_pooled"] - c["mv_acc_sc_pooled"]) * 100.0 for c in dom_cells]
-        table8_rows[dom] = {
-            "n_cells": len(dom_cells),
-            "mv_sc_mean": float(np.mean(mv_sc)),
-            "mv_pt_mean": float(np.mean(mv_pt)),
-            "delta_acc_mean": float(np.mean(delta_mv)),
-            "delta_acc_std": float(np.std(delta_mv, ddof=1)),
-        }
 
-    # 7. Entropy-predictor figure correlation (Fig. 4, line 563)
-    bench_diversity = {}
-    for model in MODELS:
-        for suffix, task_map in BENCHMARK_FILES.items():
-            records = load_records(model, suffix)
-            for task_name in task_map:
-                sc_recs = [r for r in records if r.get("task") == task_name and r["method"] == "sc"]
-                for r in sc_recs:
-                    answers = r.get("all_answers", [])
-                    if not answers:
-                        correct = r.get("all_correct", [])
-                        if correct:
-                            answers = [str(c) for c in correct]
-                    if not answers:
-                        continue
-                    K = len(answers)
-                    n_unique = len(set(str(a).strip().lower() for a in answers))
-                    bench_diversity.setdefault(task_name, []).append(n_unique / K)
-
-    tasks_sorted = sorted(bench_diversity.keys())
-    assert len(tasks_sorted) == 12
-    xs = [float(np.mean(bench_diversity[t])) for t in tasks_sorted]
-    ys = [table3_rows[t]["mean_drho_pct"] for t in tasks_sorted]
-    r_entropy, p_entropy = stats.pearsonr(xs, ys)
-    entropy_predictor = {
-        "pearson_r": float(r_entropy),
-        "p_value": float(p_entropy),
-        "n_points": len(tasks_sorted),
-    }
-
-    # 8. Accuracy-weighted voting across all 60 PT cells (Appendix app:hetero_slot)
-    wmv_results = []
-    for (model, task), mat in pt_matrices.items():
-        if mat is None or mat.shape[0] < 20 or mat.mean() < BASE_ACC_THRESHOLD:
-            continue
-        mv = wmv_mv_acc(mat)
-        wmv = weighted_mv_accuracy(mat)
-        cv = slot_cv(mat)
-        wmv_results.append({
-            "model": model,
-            "task": task,
-            "mv": mv,
-            "wmv": wmv,
-            "cv": cv,
-            "gap": wmv - mv,
-        })
-
-    assert len(wmv_results) == 60, f"Expected 60 PT cells, got {len(wmv_results)}"
-    cvs = [r["cv"] for r in wmv_results]
-    gaps = [r["gap"] for r in wmv_results]
-    r_wmv, p_wmv = stats.pearsonr(cvs, gaps)
-
-    high_cv = [r for r in wmv_results if r["cv"] > 0.225]
-    low_cv = [r for r in wmv_results if r["cv"] <= 0.225]
-    high_mv = [r for r in wmv_results if r["mv"] >= 0.30]
-    low_mv = [r for r in wmv_results if r["mv"] < 0.30]
-
-    weighted_mv_stats = {
-        "n_cells": len(wmv_results),
-        "pearson_r": float(r_wmv),
-        "p_value": float(p_wmv),
-        "high_cv_mean_gap_pp": float(np.mean([r["gap"] for r in high_cv]) * 100.0),
-        "low_cv_mean_gap_pp": float(np.mean([r["gap"] for r in low_cv]) * 100.0),
-        "high_mv_mean_gap_pp": float(np.mean([r["gap"] for r in high_mv]) * 100.0),
-        "high_mv_mean_cv": float(np.mean([r["cv"] for r in high_mv])),
-        "low_mv_mean_gap_pp": float(np.mean([r["gap"] for r in low_mv]) * 100.0),
-        "low_mv_mean_cv": float(np.mean([r["cv"] for r in low_mv])),
-        "low_mv_with_high_cv_pct": float(sum(1 for r in low_mv if r["cv"] > 0.225) / len(low_mv) * 100.0),
-        "high_mv_with_high_cv_pct": float(sum(1 for r in high_mv if r["cv"] > 0.225) / len(high_mv) * 100.0),
-    }
-
-    # 9. Block covariance analysis over valid PT cells (Appendix J, line 882)
-    # Uses build_block_covariance_matrix matching analyze_block_covariance.py
-    ratios = []
-    t_qwen7b_ratio = None
-    gsm_sc, math_sc = get_scorers()
-
-    for model in MODELS:
-        for suffix, task_map in BENCHMARK_FILES.items():
-            records = load_records(model, suffix)
-            for task_name in task_map:
-                pt_recs = [r for r in records if r.get("task") == task_name and r["method"] == "sc_prompttpl"]
-                mat = build_block_covariance_matrix(pt_recs, task_name, gsm_sc, math_sc)
-                if mat is None:
-                    continue
-                N, K = mat.shape
-                corr_matrix = np.corrcoef(mat.T)
-                np.fill_diagonal(corr_matrix, 0)
-                valid_pairs = ~np.isnan(corr_matrix)
-                if valid_pairs.sum() == 0:
-                    continue
-                c_mean = float(np.nanmean(corr_matrix[np.triu_indices(K, k=1)]))
-                keff_eq = K / (1.0 + (K - 1.0) * c_mean) if c_mean > -1.0 / (K - 1.0) else float("nan")
-                p_bar = float(mat.mean())
-                S_K = mat.sum(axis=1)
-                var_sk_over_k = float(np.var(S_K / K, ddof=1))
-                var_indep = p_bar * (1.0 - p_bar) / K
-                keff_blk = var_indep / var_sk_over_k * K if var_sk_over_k > 0 else float("nan")
-
-                if not np.isnan(keff_eq) and not np.isnan(keff_blk) and keff_eq > 0:
-                    ratio = keff_blk / keff_eq
-                    ratios.append(ratio)
-                    if task_name == "triviaqa" and model == "qwen7b":
-                        t_qwen7b_ratio = ratio
-
-    assert len(ratios) == 58, f"Expected 58 valid PT cells for block cov, got {len(ratios)}"
-    block_covariance_stats = {
-        "n_cells": len(ratios),
-        "mean_ratio": float(np.mean(ratios)),
-        "std_ratio": float(np.std(ratios, ddof=0)),  # population std matching numpy/paper
-        "triviaqa_qwen7b_ratio": float(t_qwen7b_ratio) if t_qwen7b_ratio is not None else float("nan"),
-    }
-
+def arm_statistics(mat: np.ndarray) -> dict:
+    if mat.ndim != 2 or mat.shape[1] != pt.K or mat.shape[0] < 2 or not np.isin(mat, [0, 1]).all():
+        raise pt.CellMismatchError(f"expected binary (N, {pt.K}) matrix, got {mat.shape}")
+    rho, c = compute_pairwise_rho(mat), c_eq3(mat)
     return {
-        "valid_cells_count": len(valid_cells),
-        "decorrelates_count": decorrelates_count,
-        "mean_drho_pct": mean_drho,
-        "mean_dkeff": mean_dkeff,
-        "exceptions": exceptions_summary,
-        "table3_rows": table3_rows,
-        "domain_means": domain_means,
-        "mann_whitney": mann_whitney,
-        "bootstrap_stats": bootstrap_stats,
-        "table8_rows": table8_rows,
-        "entropy_predictor": entropy_predictor,
-        "weighted_mv_stats": weighted_mv_stats,
-        "block_covariance_stats": block_covariance_stats,
+        "n_instances": len(mat), "p_bar": float(mat.mean()), "rho_hat": rho, "c_hat": c,
+        # K_eff of Table 7 uses the measured Pearson rho.
+        "K_eff_vote": k_eff(pt.K, rho), "K_eff_from_c": k_eff(pt.K, c),
+        "MV8": compute_mv_accuracy(mat), "slot_cv": float(slot_cv(mat)),
+        "weighted_MV8": float(weighted_mv_accuracy(mat)),
+        "weighted_gain_pp": float((weighted_mv_accuracy(mat) - compute_mv_accuracy(mat)) * 100),
+        "slot_accuracies": mat.mean(axis=0).tolist(),
+        "constant_slots": np.flatnonzero(mat.std(axis=0) < 1e-10).tolist(),
     }
 
 
-def format_table3_latex(table3_rows: Dict[str, Any]) -> str:
-    """Format LaTeX rows for Table 3."""
-    lines = []
-    for i, (domain, tasks) in enumerate(BENCHMARK_ORDER_TABLE3):
-        if i > 0:
-            lines.append(r"\midrule")
-        lines.append(f"\\multirow{{{len(tasks)}}}{{*}}{{{domain}}}")
-        for task in tasks:
-            row = table3_rows[task]
-            name = row["display_name"]
-            ans_space = row["answer_space"]
-            n = row["n_models"]
-            drho = row["mean_drho_pct"]
-            dkeff = row["mean_dkeff"]
-            r_sc = row["mean_rho_sc"]
-            r_pt = row["mean_rho_pt"]
-
-            # Match paper's sign and phantom spacing
-            if drho < 0:
-                if abs(drho) < 10.0:
-                    drho_str = f"$\\hphantom{{-}}{{-}}{abs(drho):.1f}$"
-                else:
-                    drho_str = f"$-${abs(drho):.1f}"
-            else:
-                drho_str = f"$+${drho:.1f}"
-
-            dkeff_str = f"$+${dkeff:.1f}" if dkeff >= 0 else f"$-${abs(dkeff):.1f}"
-
-            line = f"  & {name:<10} & {ans_space:<15} & {n} & {drho_str} & {dkeff_str} & {r_sc:.2f} & {r_pt:.2f} \\\\"
-            lines.append(line)
-
-    return "\n".join(lines)
+def relative_drho(rho_sc: float, rho_pt: float) -> float:
+    return ((rho_pt - rho_sc) / abs(rho_sc) * 100
+            if np.isfinite(rho_sc) and abs(rho_sc) > 0.01 else float("nan"))
 
 
-def main():
-    print("=" * 80)
-    print("Cross-benchmark prompt-template matrix (Table 3)")
-    print("=" * 80)
+def excluded_base_accuracy(p_bar_sc: float) -> bool:
+    """Exact historical exclusion: only pooled SC path accuracy, strictly below cutoff."""
+    return bool(np.isnan(p_bar_sc) or p_bar_sc < BASE_ACC_THRESHOLD)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. Run the pipeline (numeric scorer for GSM8K, MATH-500 scorer for MATH)
-    print("\n[1/3] Running the 60-cell pipeline...")
-    cells, pt_mats = run_table3_pipeline(n_boot=10_000, rng_seed=2026)
-    derived = compute_derived_numbers(cells, pt_mats)
-    print("      Completed: {} valid, {} decorrelate, mean Delta rho = {}%".format(
-        derived["valid_cells_count"], derived["decorrelates_count"], fmt_num(derived["mean_drho_pct"], 2)
-    ))
+def paired_bootstrap(sc: np.ndarray, pt_mat: np.ndarray, n_boot: int,
+                     rng: np.random.Generator) -> np.ndarray:
+    """Use the imported fast Pearson estimator with one shared row draw per replicate.
 
-    # 2. Assemble numbers.json
-    print("\n[2/3] Writing numbers.json...")
-    cells_json = {f"{model}_{task}": cell for (model, task), cell in cells.items()}
-    deliverable_numbers = {
-        "metadata": {
-            "output_dir": str(OUTPUT_DIR),
-            "n_cells": len(cells_json),
-            "valid_cells_count": derived["valid_cells_count"],
-        },
-        "cells": cells_json,
-        "derived_numbers": derived,
-    }
-    numbers_path = OUTPUT_DIR / "numbers.json"
-    with open(numbers_path, "w") as f:
-        json.dump(to_json_safe(deliverable_numbers), f, indent=2, allow_nan=False)
-    print(f"      Wrote {numbers_path}")
+    Retains the old bootstrap's |rho_SC| >= .01 denominator guard. Missing draws
+    remain NaN so simultaneous domain replicates retain their original indices.
+    """
+    if sc.shape != pt_mat.shape or sc.ndim != 2 or n_boot < 1:
+        raise pt.CellMismatchError("paired bootstrap requires matching matrices and positive draws")
+    draws = np.full(n_boot, np.nan)
+    for b in range(n_boot):
+        idx = rng.integers(0, len(sc), size=len(sc))
+        rs, rp = _mean_pairwise_rho_vec(sc[idx]), _mean_pairwise_rho_vec(pt_mat[idx])
+        if np.isfinite(rs) and np.isfinite(rp) and abs(rs) >= 0.01:
+            draws[b] = (rp - rs) / abs(rs) * 100
+    return draws
 
-    # 3. Assemble rows_table3.tex
-    print("\n[3/3] Writing rows_table3.tex...")
-    tex_content = format_table3_latex(derived["table3_rows"])
-    tex_path = OUTPUT_DIR / "rows_table3.tex"
-    with open(tex_path, "w") as f:
-        f.write(tex_content + "\n")
-    print(f"      Wrote {tex_path}")
+
+def mean(rows: list[dict], key: str) -> float | None:
+    return float(np.mean([r[key] for r in rows])) if rows else None
+
+
+def pearson(xs: list, ys: list) -> dict:
+    if len(xs) < 2 or np.ptp(xs) == 0 or np.ptp(ys) == 0:
+        return {"pearson_r": None, "p_value": None}
+    result = stats.pearsonr(xs, ys)
+    return {"pearson_r": float(result.statistic), "p_value": float(result.pvalue)}
+
+
+def weighted_summary(cells: list[dict]) -> dict:
+    # Deliberately screen PT independently of the SC-based primary validity rule.
+    rows = [{"model": c["model"], "task": c["task"], **c["PT"]}
+            for c in cells if c["PT"]["p_bar"] >= BASE_ACC_THRESHOLD]
+    result = {"n_cells": len(rows), "cells": rows, "cv_threshold": CV_THRESHOLD,
+              "mv_threshold": MV_THRESHOLD, "median_cv": float(np.median([r["slot_cv"] for r in rows]))}
+    result.update(pearson([r["slot_cv"] for r in rows], [r["weighted_gain_pp"] for r in rows]))
+    for name, subset in {
+        "high_cv": [r for r in rows if r["slot_cv"] > CV_THRESHOLD],
+        "low_cv": [r for r in rows if r["slot_cv"] <= CV_THRESHOLD],
+        "high_mv": [r for r in rows if r["MV8"] >= MV_THRESHOLD],
+        "low_mv": [r for r in rows if r["MV8"] < MV_THRESHOLD],
+    }.items():
+        result[name] = {"n": len(subset), "mean_gain_pp": mean(subset, "weighted_gain_pp"),
+                        "mean_cv": mean(subset, "slot_cv"),
+                        "with_high_cv_pct": (100 * sum(r["slot_cv"] > CV_THRESHOLD for r in subset)
+                                             / len(subset)) if subset else None}
+    return result
+
+
+def block_statistic(mat: np.ndarray) -> dict:
+    """Reuse historical matrix eligibility, then its inline sample-variance formula."""
+    records = [{"all_correct": row.tolist()} for row in mat]
+    checked = build_block_covariance_matrix(records, "gsm8k", True, *get_scorers())
+    if checked is None:
+        return {"reason": "PT p_bar below base-accuracy threshold or N < 20"}
+    rho = compute_pairwise_rho(checked)  # same upper-triangle nanmean, skips constant slots
+    variance = float(np.var(checked.mean(axis=1), ddof=1))
+    if not np.isfinite(rho) or rho <= -1 / (pt.K - 1) or variance <= 0:
+        return {"reason": "undefined Pearson correlation or degenerate vote variance"}
+    keff_block = float(checked.mean() * (1 - checked.mean()) / variance)
+    keff_vote = k_eff(pt.K, rho)
+    return {"K_eff_block": keff_block, "K_eff_vote": keff_vote,
+            "ratio": keff_block / keff_vote}
+
+
+def derive(cells: list[dict], draws: dict) -> dict:
+    valid = [c for c in cells if not c["excluded_base_acc"]]
+    excluded = [c for c in cells if c["excluded_base_acc"]]
+    result = {"valid_cells_count": len(valid), "excluded_cells_count": len(excluded),
+              "excluded_cells": [{"model": c["model"], "task": c["task"], "p_bar_sc": c["SC"]["p_bar"]}
+                                 for c in excluded],
+              "decorrelates_count": sum(c["delta_rho_pct"] < 0 for c in valid),
+              "mean_drho_pct": mean(valid, "delta_rho_pct"), "mean_dkeff": mean(valid, "delta_K_eff_vote"),
+              "exceptions": [{"model": c["model"], "task": c["task"], "drho_pct": c["delta_rho_pct"],
+                              "p_bar_sc": c["SC"]["p_bar"], "p_bar_pt": c["PT"]["p_bar"]}
+                             for c in valid if c["delta_rho_pct"] >= 0]}
+    table, domains, acc = {}, {}, {}
+    for task in TASKS:
+        selected = [c for c in valid if c["task"] == task]
+        if not any(c["task"] == task for c in cells):
+            continue
+        table[task] = {"domain": DOMAINS[task], "display_name": TASK_DISPLAY_NAMES[task],
+                       "answer_space": TASK_ANSWER_SPACE[task], "n_models": len(selected),
+                       "mean_drho_pct": mean(selected, "delta_rho_pct"),
+                       "mean_dkeff": mean(selected, "delta_K_eff_vote"),
+                       "mean_rho_sc": float(np.mean([c["SC"]["rho_hat"] for c in selected])) if selected else None,
+                       "mean_rho_pt": float(np.mean([c["PT"]["rho_hat"] for c in selected])) if selected else None,
+                       "mean_sc_diversity": mean([c["SC"] for c in selected], "answer_diversity")}
+    for dom, _ in BENCHMARK_ORDER_TABLE3:
+        selected = [c for c in valid if c["domain"] == dom]
+        ds = [c["delta_rho_pct"] for c in selected]
+        domains[dom] = {"n_cells": len(selected), "mean_drho_pct": float(np.mean(ds)) if ds else None,
+                        "min_drho_pct": min(ds) if ds else None, "max_drho_pct": max(ds) if ds else None}
+        deltas = [(c["PT"]["MV8"] - c["SC"]["MV8"]) * 100 for c in selected]
+        acc[dom] = {"n_cells": len(selected),
+                    "mv_sc_mean": float(np.mean([c["SC"]["MV8"] * 100 for c in selected])) if selected else None,
+                    "mv_pt_mean": float(np.mean([c["PT"]["MV8"] * 100 for c in selected])) if selected else None,
+                    "delta_acc_mean": float(np.mean(deltas)) if deltas else None,
+                    "delta_acc_std": float(np.std(deltas, ddof=1)) if len(deltas) > 1 else None}
+    math_cells, qa_cells = ([c for c in valid if c["domain"] == d] for d in ("Math", "QA"))
+    mw = {"n_math": len(math_cells), "n_qa": len(qa_cells), "alternative": "two-sided"}
+    if math_cells and qa_cells:
+        observed = stats.mannwhitneyu([c["delta_rho_pct"] for c in math_cells],
+                                     [c["delta_rho_pct"] for c in qa_cells], alternative="two-sided")
+        arrays = [np.column_stack([draws[c["id"]] for c in group]) for group in (math_cells, qa_cells)]
+        finite = np.isfinite(arrays[0]).all(axis=1) & np.isfinite(arrays[1]).all(axis=1)
+        # SciPy auto selects exact for <=8 untied observations, asymptotic otherwise.
+        ps = np.asarray([stats.mannwhitneyu(x, y, alternative="two-sided").pvalue
+                         for x, y in zip(arrays[0][finite], arrays[1][finite])])
+        mw.update(u_statistic=float(observed.statistic), p_value=float(observed.pvalue),
+                  bootstrap_replicates_used=int(finite.sum()),
+                  bootstrap_replicates_dropped=int((~finite).sum()),
+                  bootstrap_fraction_p_lt_0001=float(np.mean(ps < 0.001)))
+    widths = [c["delta_rho_ci95"][1] - c["delta_rho_ci95"][0] for c in valid]
+    bs = {"ci_width_median": float(np.median(widths)),
+          "ci_width_iqr_25": float(np.percentile(widths, 25)), "ci_width_iqr_75": float(np.percentile(widths, 75)),
+          "cells_excluding_zero_count": sum(c["delta_rho_ci95"][0] > 0 or c["delta_rho_ci95"][1] < 0 for c in valid),
+          "drho_min": min(c["delta_rho_pct"] for c in valid), "drho_max": max(c["delta_rho_pct"] for c in valid),
+          "named_cells": {c["id"]: {"drho_pct": c["delta_rho_pct"], "ci95": c["delta_rho_ci95"],
+                                    "p_bar_sc": c["SC"]["p_bar"]}
+                          for c in valid if c["task"] in ("triviaqa", "hotpotqa", "math")}}
+    bs["benchmark_precision"] = {}
+    for task in ("triviaqa", "hotpotqa"):
+        selected = [c for c in valid if c["task"] == task]
+        if selected:
+            bs["benchmark_precision"][task] = {
+                "n_cells": len(selected),
+                "cells_excluding_zero": sum(c["delta_rho_ci95"][0] > 0 or c["delta_rho_ci95"][1] < 0 for c in selected),
+                "ci_low_min": min(c["delta_rho_ci95"][0] for c in selected),
+                "ci_high_max": max(c["delta_rho_ci95"][1] for c in selected),
+            }
+    points = [r for r in table.values() if r["n_models"]]
+    entropy = {**pearson([r["mean_sc_diversity"] for r in points], [r["mean_drho_pct"] for r in points]),
+               "n_points": len(points)}
+    sc_weighting = [{"model": c["model"], "task": c["task"], **c["SC"]} for c in valid]
+    blocks = [{"model": c["model"], "task": c["task"], **c["block"]} for c in valid if "ratio" in c["block"]]
+    block_excluded = [{"model": c["model"], "task": c["task"], **c["block"]} for c in valid if "ratio" not in c["block"]]
+    result.update(table3_rows=table, domain_means=domains, table8_rows=acc, mann_whitney=mw,
+                  bootstrap_stats=bs, entropy_predictor=entropy, weighted_mv_stats=weighted_summary(cells),
+                  sc_weighting={"n_cells": len(sc_weighting),
+                                "max_slot_cv": max(r["slot_cv"] for r in sc_weighting) if sc_weighting else None,
+                                "min_cell": min(sc_weighting, key=lambda r: r["weighted_gain_pp"]) if sc_weighting else None,
+                                "max_cell": max(sc_weighting, key=lambda r: r["weighted_gain_pp"]) if sc_weighting else None},
+                  block_covariance_stats={"n_cells": len(blocks), "excluded_count": len(block_excluded),
+                                          "excluded": block_excluded, "population": "SC-valid cells, then PT eligibility",
+                                          "mean_ratio": mean(blocks, "ratio"),
+                                          "triviaqa_qwen7b_ratio": next((b["ratio"] for b in blocks
+                                                                          if b["task"] == "triviaqa" and b["model"] == "qwen7b"), None),
+                                          "std_ratio": float(np.std([b["ratio"] for b in blocks], ddof=0)) if blocks else None,
+                                          "max_cell": max(blocks, key=lambda b: b["ratio"]) if blocks else None,
+                                          "cells": blocks})
+    return result
+
+
+def build(tasks: Sequence[str], n_boot: int = N_BOOT) -> dict:
+    if not tasks or len(set(tasks)) != len(tasks) or set(tasks) - set(TASKS):
+        raise ValueError("tasks must be a nonempty unique selection of paper benchmarks")
+    # Canonical order makes an invocation insensitive to the ordering of --tasks.
+    tasks = [t for t in TASKS if t in tasks]
+    cells, draws = [], {}
+    for task in tasks:
+        for model in pt.T12_MODELS:
+            print(f"Loading {model}/{task}", flush=True)
+            pt_cells, sc_cells, source = load_cell(model, task)
+            mats = {"PT": correctness_matrix(pt_cells, task), "SC": correctness_matrix(sc_cells, task)}
+            arms = {name: arm_statistics(mat) for name, mat in mats.items()}
+            arms["SC"]["answer_diversity"] = float(np.mean([
+                len({str(a).strip().lower() for a in ans}) / pt.K for ans, _ in sc_cells]))
+            excluded = excluded_base_accuracy(arms["SC"]["p_bar"])
+            cell_id = f"{model}_{task}"
+            drho = relative_drho(arms["SC"]["rho_hat"], arms["PT"]["rho_hat"])
+            ci, n_finite = None, 0
+            if not excluded:
+                if not np.isfinite(drho):
+                    raise ValueError(f"{cell_id}: SC-valid cell has undefined relative rho")
+                # Stable independent stream per cell; adding ARC/WG cannot change existing CIs.
+                rng = np.random.default_rng(np.random.SeedSequence([
+                    RNG_SEED, TASKS.index(task), pt.T12_MODELS.index(model)]))
+                draws[cell_id] = paired_bootstrap(mats["SC"], mats["PT"], n_boot, rng)
+                finite = draws[cell_id][np.isfinite(draws[cell_id])]
+                n_finite = len(finite)
+                if not n_finite:
+                    raise ValueError(f"{cell_id}: no finite bootstrap draws")
+                ci = np.percentile(finite, [2.5, 97.5]).tolist()
+            cells.append({"id": cell_id, "model": model, "task": task, "domain": DOMAINS[task],
+                          **arms, "source": source, "scorer": get_scorer(task).name,
+                          "excluded_base_acc": excluded, "delta_rho_pct": drho,
+                          "delta_K_eff_vote": arms["PT"]["K_eff_vote"] - arms["SC"]["K_eff_vote"],
+                          "delta_rho_ci95": ci, "bootstrap_finite_replicates": n_finite,
+                          "bootstrap_dropped_replicates": n_boot - n_finite if not excluded else None,
+                          "block": block_statistic(mats["PT"])})
+    return {"metadata": {"tasks": tasks, "models": list(pt.T12_MODELS), "n_cells": len(cells),
+                         "K": pt.K, "bootstrap_replicates": n_boot, "rng_seed": RNG_SEED,
+                         "base_accuracy_threshold": BASE_ACC_THRESHOLD,
+                         "environment": {"python": platform.python_version(), "numpy": np.__version__,
+                                         "scipy": scipy.__version__, "platform": platform.platform()},
+                         "code_sources": [fingerprint(ROOT / "scripts" / name) for name in (
+                             "reproduce_cross_benchmark.py", "cross_benchmark_outputs.py",
+                             "matched_arms.py", "aggregate_5seed.py", "analyze_mv_vs_weighted.py",
+                             "correlation_estimators.py", "cross_benchmark_common.py",
+                             "scoring_v2.py", "run_sc_kvar_v2.py", "tasks12.py")]},
+            "cells": cells, "derived": derive(cells, draws)}
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tasks", nargs="+", choices=TASKS, default=TASKS)
+    args = parser.parse_args(argv)
+    numbers = build(args.tasks)
+    write_outputs(numbers, OUTPUT_DIR)
+    print(json.dumps({k: numbers["derived"][k] for k in (
+        "valid_cells_count", "excluded_cells_count", "decorrelates_count", "mean_drho_pct", "mean_dkeff")}))
+    print(f"Wrote {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
